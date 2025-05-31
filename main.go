@@ -1,148 +1,194 @@
 package main
 
 import (
-	"bufio"
+	"encoding/json"
 	"fmt"
-	"os"
-	"strconv"
+	"io"
+	"net/http"
+	"os/exec"
+	"runtime"
 	"strings"
+
+	"lem-in/lib"
 )
 
-type Room struct {
-	Name    string
-	X, Y    int
-	Links   []*Room
-	Visited bool
-	Parent  *Room
+type RoomJSON struct {
+	Name    string `json:"name"`
+	X       int    `json:"x"`
+	Y       int    `json:"y"`
+	IsStart bool   `json:"isStart,omitempty"`
+	IsEnd   bool   `json:"isEnd,omitempty"`
 }
 
-var (
-	rooms     = make(map[string]*Room)
-	startRoom *Room
-	endRoom   *Room
-	nAnts     int
-)
+type TunnelJSON struct {
+	From string `json:"from"`
+	To   string `json:"to"`
+}
+
+type MoveJSON struct {
+	AntID  string `json:"antId"`
+	ToRoom string `json:"toRoom"`
+}
+
+type TurnJSON struct {
+	Moves []MoveJSON `json:"moves"`
+}
+
+type SimulationJSON struct {
+	Rooms           []RoomJSON   `json:"rooms"`
+	Tunnels         []TunnelJSON `json:"tunnels"`
+	AntsCount       int          `json:"antsCount"`
+	StartRoom       string       `json:"startRoom"`
+	EndRoom         string       `json:"endRoom"`
+	SimulationTurns []TurnJSON   `json:"simulationTurns"`
+}
 
 func main() {
-	if len(os.Args) < 2 {
-		fmt.Println("Usage: go run . <filename>")
-		return
-	}
-
-	filename := os.Args[1]
-	lines, err := readLines(filename)
-	if err != nil {
-		fmt.Println("ERROR: could not read file")
-		return
-	}
-
-	if !parseInput(lines) {
-		fmt.Println("ERROR: invalid data format")
-		return
-	}
-
-	path := bfs(startRoom, endRoom)
-	if path == nil {
-		fmt.Println("ERROR: no path found")
-		return
-	}
-
-	simulateAnts(path)
+	http.Handle("/", http.FileServer(http.Dir("static")))
+	http.HandleFunc("/simulate", simulateHandler)
+	fmt.Println("Server running on http://localhost:8080")
+	go openBrowser("http://localhost:8080")
+	http.ListenAndServe(":8080", nil)
 }
 
-func readLines(filename string) ([]string, error) {
-	file, err := os.Open(filename)
-	if err != nil {
-		return nil, err
+func openBrowser(url string) {
+	var cmd string
+	var args []string
+	switch runtime.GOOS {
+	case "darwin":
+		cmd = "open"
+	case "windows":
+		cmd = "rundll32"
+		args = append(args, "url.dll,FileProtocolHandler")
+	default:
+		cmd = "xdg-open"
 	}
-	defer file.Close()
-
-	var lines []string
-	scanner := bufio.NewScanner(file)
-	for scanner.Scan() {
-		lines = append(lines, scanner.Text())
-	}
-	return lines, scanner.Err()
+	args = append(args, url)
+	exec.Command(cmd, args...).Start()
 }
 
-func parseInput(lines []string) bool {
-	var err error
-	state := "ants"
+func simulateHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "POST only", http.StatusMethodNotAllowed)
+		return
+	}
+	data, err := io.ReadAll(r.Body)
+	if err != nil {
+		http.Error(w, "Failed to read input", http.StatusBadRequest)
+		return
+	}
+	lines := strings.Split(string(data), "\n")
+	field := lib.Field{}
+	err = lib.ResolveInput(lines, &field)
+	if err != nil {
+		http.Error(w, "Invalid format: "+err.Error(), http.StatusBadRequest)
+		return
+	}
 
-	for i := 0; i < len(lines); i++ {
-		line := strings.TrimSpace(lines[i])
-		if line == "" || (strings.HasPrefix(line, "#") && !strings.HasPrefix(line, "##")) {
-			continue
-		}
+	visited := make(map[string]bool)
+	var paths [][]string
+	lib.FindShortestPaths(field, "", []string{}, visited, &paths)
+	paths = lib.RemoveTooLongPaths(paths)
 
-		switch line {
-		case "##start":
-			if i+1 >= len(lines) {
-				return false
-			}
-			i++
-			room := parseRoom(lines[i])
-			if room == nil {
-				return false
-			}
-			startRoom = room
-			rooms[room.Name] = room
+	if len(paths) == 0 {
+		http.Error(w, "No valid paths", http.StatusUnprocessableEntity)
+		return
+	}
 
-		case "##end":
-			if i+1 >= len(lines) {
-				return false
-			}
-			i++
-			room := parseRoom(lines[i])
-			if room == nil {
-				return false
-			}
-			endRoom = room
-			rooms[room.Name] = room
+	turnLog := [][]MoveJSON{}
+	for _, ant := range field.Ants {
+		ant.CurrentRoom = field.StartRoomName
+		ant.IsFinished = false
+	}
 
-		default:
-			if state == "ants" {
-				nAnts, err = strconv.Atoi(line)
-				if err != nil || nAnts <= 0 {
-					return false
+	for done := false; !done; {
+		done = true
+		turn := []MoveJSON{}
+		used := map[string]bool{}
+		for _, ant := range field.Ants {
+			if ant.CurrentRoom == field.EndRoomName {
+				ant.IsFinished = true
+				continue
+			}
+			done = false
+			next := getNext(ant.CurrentRoom, paths, used, field)
+			if next != "" {
+				used[ant.CurrentRoom+"-"+next] = true
+				turn = append(turn, MoveJSON{AntID: fmt.Sprintf("L%d", ant.ID+1), ToRoom: next})
+				ant.CurrentRoom = next
+				if next == field.EndRoomName {
+					ant.IsFinished = true
 				}
-				state = "rooms"
-			} else if strings.Contains(line, " ") {
-				room := parseRoom(line)
-				if room == nil || rooms[room.Name] != nil {
-					return false
-				}
-				rooms[room.Name] = room
-			} else if strings.Contains(line, "-") {
-				link := strings.Split(line, "-")
-				if len(link) != 2 {
-					return false
-				}
-				a, b := rooms[link[0]], rooms[link[1]]
-				if a == nil || b == nil || a == b {
-					return false
-				}
-				a.Links = append(a.Links, b)
-				b.Links = append(b.Links, a)
 			}
 		}
+		if len(turn) > 0 {
+			turnLog = append(turnLog, turn)
+		}
 	}
-	return startRoom != nil && endRoom != nil
+
+	var rooms []RoomJSON
+	for _, r := range field.Rooms {
+		x, y := 0, 0
+		fmt.Sscanf(r.Name+" 0 0", "%s %d %d", &r.Name, &x, &y)
+		rooms = append(rooms, RoomJSON{
+			Name:    r.Name,
+			X:       x,
+			Y:       y,
+			IsStart: r.Name == field.StartRoomName,
+			IsEnd:   r.Name == field.EndRoomName,
+		})
+	}
+
+	tunnels := []TunnelJSON{}
+	seen := make(map[string]bool)
+	for _, r := range field.Rooms {
+		for _, conn := range r.ConnectedRooms {
+			key := r.Name + "-" + conn
+			rev := conn + "-" + r.Name
+			if !seen[key] && !seen[rev] {
+				tunnels = append(tunnels, TunnelJSON{From: r.Name, To: conn})
+				seen[key] = true
+			}
+		}
+	}
+
+	out := SimulationJSON{
+		Rooms:           rooms,
+		Tunnels:         tunnels,
+		AntsCount:       len(field.Ants),
+		StartRoom:       field.StartRoomName,
+		EndRoom:         field.EndRoomName,
+		SimulationTurns: []TurnJSON{},
+	}
+	for _, turn := range turnLog {
+		out.SimulationTurns = append(out.SimulationTurns, TurnJSON{Moves: turn})
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+	json.NewEncoder(w).Encode(out)
 }
 
-func parseRoom(line string) *Room {
-	if strings.HasPrefix(line, "L") || strings.HasPrefix(line, "#") {
-		return nil
+func getNext(current string, paths [][]string, used map[string]bool, field lib.Field) string {
+	for _, path := range paths {
+		for i, room := range path {
+			if room == current && i+1 < len(path) {
+				next := path[i+1]
+				if used[current+"-"+next] {
+					continue
+				}
+				occupied := false
+				for _, ant := range field.Ants {
+					if ant.CurrentRoom == next {
+						occupied = true
+						break
+					}
+				}
+				if !occupied || next == field.EndRoomName {
+					return next
+				}
+			}
+		}
 	}
-	parts := strings.Fields(line)
-	if len(parts) != 3 {
-		return nil
-	}
-
-	x, err1 := strconv.Atoi(parts[1])
-	y, err2 := strconv.Atoi(parts[2])
-	if err1 != nil || err2 != nil {
-		return nil
-	}
-	return &Room{Name: parts[0], X: x, Y: y}
+	return ""
 }

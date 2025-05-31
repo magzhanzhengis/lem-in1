@@ -1,0 +1,373 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="UTF-8">
+  <title>Визуализатор Lem-in</title>
+  <style>
+    body {
+      font-family: sans-serif;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      margin: 20px;
+      background-color: #f0f0f0;
+    }
+    #controls {
+      margin-bottom: 20px;
+      padding: 15px;
+      background-color: #fff;
+      border-radius: 8px;
+      box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+    }
+    #controls > * {
+      margin: 5px;
+    }
+    textarea {
+      width: 600px;
+      height: 200px;
+      font-family: monospace;
+      padding: 10px;
+    }
+    canvas {
+      border: 1px solid #ccc;
+      background-color: #fff;
+      box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+    }
+    #turnInfo {
+      margin-top: 10px;
+      font-size: 1.2em;
+      color: #333;
+    }
+    button {
+      padding: 8px 15px;
+      background-color: #007bff;
+      color: white;
+      border: none;
+      border-radius: 4px;
+      cursor: pointer;
+      font-size: 1em;
+    }
+    button:hover {
+      background-color: #0056b3;
+    }
+    button:disabled {
+      background-color: #ccc;
+      cursor: not-allowed;
+    }
+    #errorMessage {
+      color: red;
+      margin-top: 10px;
+    }
+  </style>
+</head>
+<body>
+  <h1>Визуализатор Lem-in</h1>
+  <div id="controls">
+    <textarea id="mapInput" placeholder="Вставьте сюда карту Lem-in с движениями муравьёв..."></textarea><br>
+    <button id="parseButton">Показать карту</button>
+    <button id="nextTurnButton" disabled>Следующий ход</button>
+    <button id="autoPlayButton" disabled>Автовоспроизведение</button>
+    <button id="resetButton" disabled>Сброс</button>
+  </div>
+  <div id="turnInfo">Ход: 0</div>
+  <div id="errorMessage"></div>
+  <canvas id="leminCanvas" width="800" height="600"></canvas>
+
+  <script>
+    const canvas = document.getElementById('leminCanvas');
+    const ctx = canvas.getContext('2d');
+    const parseButton = document.getElementById('parseButton');
+    const nextTurnButton = document.getElementById('nextTurnButton');
+    const autoPlayButton = document.getElementById('autoPlayButton');
+    const resetButton = document.getElementById('resetButton');
+    const turnInfo = document.getElementById('turnInfo');
+    const errorMessageDiv = document.getElementById('errorMessage');
+
+    let simulationData = null;
+    let antPositions = new Map();
+    let currentTurn = 0;
+    let autoPlayInterval = null;
+
+    function parseTxtMap(content) {
+      const lines = content.split(/\r?\n/).map(l => l.trim()).filter(l => l.length > 0);
+      
+      if (lines.length === 0) {
+        throw new Error("Пустой ввод");
+      }
+      
+      let antsCount = parseInt(lines[0]);
+      if (isNaN(antsCount) || antsCount <= 0) {
+        throw new Error("Неверное количество муравьёв");
+      }
+      
+      const rooms = [];
+      const tunnels = [];
+      const simulationTurns = [];
+      let startRoom = null;
+      let endRoom = null;
+      let parsingMoves = false;
+      let nextIsStart = false;
+      let nextIsEnd = false;
+
+      for (let i = 1; i < lines.length; i++) {
+        const line = lines[i];
+        
+        // Check if we've reached the movement section
+        if (line.startsWith("L") && line.includes("-")) {
+          parsingMoves = true;
+        }
+
+        if (!parsingMoves) {
+          if (line === '##start') {
+            nextIsStart = true;
+            continue;
+          } else if (line === '##end') {
+            nextIsEnd = true;
+            continue;
+          } else if (line.includes(' ') && !line.startsWith('#')) {
+            // This is a room definition
+            const parts = line.split(' ');
+            if (parts.length >= 3) {
+              const [name, x, y] = parts;
+              const room = { 
+                name, 
+                x: parseInt(x), 
+                y: parseInt(y), 
+                isStart: nextIsStart, 
+                isEnd: nextIsEnd 
+              };
+              rooms.push(room);
+              
+              if (nextIsStart) {
+                startRoom = name;
+                nextIsStart = false;
+              }
+              if (nextIsEnd) {
+                endRoom = name;
+                nextIsEnd = false;
+              }
+            }
+          } else if (line.includes('-') && !line.startsWith('#') && !line.startsWith('L')) {
+            // This is a tunnel definition
+            const [from, to] = line.split('-');
+            if (from && to) {
+              tunnels.push({ from: from.trim(), to: to.trim() });
+            }
+          }
+        } else {
+          // Parse movement line
+          if (line.startsWith("L")) {
+            const moveParts = line.split(' ').filter(part => part.trim().length > 0);
+            const moves = [];
+            
+            for (const part of moveParts) {
+              if (part.includes('-')) {
+                const [antId, toRoom] = part.split('-');
+                if (antId && toRoom) {
+                  moves.push({ antId: antId.trim(), toRoom: toRoom.trim() });
+                }
+              }
+            }
+            
+            if (moves.length > 0) {
+              simulationTurns.push({ turn: simulationTurns.length + 1, moves });
+            }
+          }
+        }
+      }
+
+      if (!startRoom || !endRoom) {
+        throw new Error("Не найдены стартовая или финишная комнаты");
+      }
+
+      if (rooms.length === 0) {
+        throw new Error("Не найдены комнаты");
+      }
+
+      return {
+        antsCount,
+        startRoom,
+        endRoom,
+        rooms,
+        tunnels,
+        simulationTurns
+      };
+    }
+
+    function drawMap() {
+      ctx.clearRect(0, 0, canvas.width, canvas.height);
+      if (!simulationData) return;
+
+      // Draw tunnels
+      ctx.strokeStyle = '#aaa';
+      ctx.lineWidth = 2;
+      simulationData.tunnels.forEach(({ from, to }) => {
+        const roomA = simulationData.rooms.find(r => r.name === from);
+        const roomB = simulationData.rooms.find(r => r.name === to);
+        if (roomA && roomB) {
+          ctx.beginPath();
+          ctx.moveTo(roomA.x * 40 + 100, roomA.y * 40 + 100);
+          ctx.lineTo(roomB.x * 40 + 100, roomB.y * 40 + 100);
+          ctx.stroke();
+        }
+      });
+
+      // Draw rooms
+      simulationData.rooms.forEach(room => {
+        const x = room.x * 40 + 100;
+        const y = room.y * 40 + 100;
+        
+        ctx.beginPath();
+        ctx.arc(x, y, 20, 0, 2 * Math.PI);
+        ctx.fillStyle = room.isStart ? '#4CAF50' : room.isEnd ? '#F44336' : '#2196F3';
+        ctx.fill();
+        ctx.strokeStyle = '#333';
+        ctx.lineWidth = 2;
+        ctx.stroke();
+        
+        // Room name
+        ctx.fillStyle = 'white';
+        ctx.font = '12px sans-serif';
+        ctx.textAlign = 'center';
+        ctx.textBaseline = 'middle';
+        ctx.fillText(room.name, x, y);
+      });
+
+      // Draw ants
+      for (const [antId, roomName] of antPositions) {
+        const room = simulationData.rooms.find(r => r.name === roomName);
+        if (room) {
+          const x = room.x * 40 + 100;
+          const y = room.y * 40 + 100;
+          
+          // Count ants in this room for positioning
+          const antsInRoom = Array.from(antPositions.entries()).filter(([id, rName]) => rName === roomName);
+          const antIndex = antsInRoom.findIndex(([id]) => id === antId);
+          const totalAnts = antsInRoom.length;
+          
+          // Position ants around the room
+          const angle = (antIndex / totalAnts) * 2 * Math.PI;
+          const antX = x + Math.cos(angle) * 25;
+          const antY = y + Math.sin(angle) * 25;
+          
+          ctx.beginPath();
+          ctx.arc(antX, antY, 8, 0, 2 * Math.PI);
+          ctx.fillStyle = '#FF9800';
+          ctx.fill();
+          ctx.strokeStyle = '#333';
+          ctx.lineWidth = 1;
+          ctx.stroke();
+          
+          // Ant ID
+          ctx.fillStyle = 'black';
+          ctx.font = '10px sans-serif';
+          ctx.textAlign = 'center';
+          ctx.textBaseline = 'middle';
+          ctx.fillText(antId, antX, antY);
+        }
+      }
+    }
+
+    function applyTurn(turnIdx) {
+      if (turnIdx < simulationData.simulationTurns.length) {
+        const turn = simulationData.simulationTurns[turnIdx];
+        turn.moves.forEach(move => {
+          antPositions.set(move.antId, move.toRoom);
+        });
+      }
+    }
+
+    function updateTurnInfo() {
+      turnInfo.textContent = `Ход: ${currentTurn} / ${simulationData.simulationTurns.length}`;
+    }
+
+    function resetSimulation() {
+      currentTurn = 0;
+      antPositions.clear();
+      
+      // Initialize all ants at start room
+      for (let i = 1; i <= simulationData.antsCount; i++) {
+        antPositions.set(`L${i}`, simulationData.startRoom);
+      }
+      
+      drawMap();
+      updateTurnInfo();
+      nextTurnButton.disabled = false;
+      autoPlayButton.disabled = false;
+      autoPlayButton.textContent = 'Автовоспроизведение';
+    }
+
+    parseButton.addEventListener('click', () => {
+      const text = document.getElementById('mapInput').value.trim();
+      errorMessageDiv.textContent = '';
+      
+      if (!text) {
+        errorMessageDiv.textContent = 'Пожалуйста, введите данные карты';
+        return;
+      }
+      
+      try {
+        simulationData = parseTxtMap(text);
+        console.log('Parsed data:', simulationData); // Debug log
+        resetSimulation();
+        resetButton.disabled = false;
+      } catch (e) {
+        console.error('Parse error:', e); // Debug log
+        errorMessageDiv.textContent = 'Ошибка парсинга: ' + e.message;
+      }
+    });
+
+    nextTurnButton.addEventListener('click', () => {
+      if (currentTurn < simulationData.simulationTurns.length) {
+        applyTurn(currentTurn);
+        currentTurn++;
+        drawMap();
+        updateTurnInfo();
+        
+        if (currentTurn >= simulationData.simulationTurns.length) {
+          nextTurnButton.disabled = true;
+          autoPlayButton.disabled = true;
+        }
+      }
+    });
+
+    autoPlayButton.addEventListener('click', () => {
+      if (autoPlayInterval) {
+        clearInterval(autoPlayInterval);
+        autoPlayInterval = null;
+        autoPlayButton.textContent = 'Автовоспроизведение';
+        nextTurnButton.disabled = false;
+        return;
+      }
+      
+      autoPlayButton.textContent = 'Пауза';
+      nextTurnButton.disabled = true;
+      
+      autoPlayInterval = setInterval(() => {
+        if (currentTurn < simulationData.simulationTurns.length) {
+          applyTurn(currentTurn);
+          currentTurn++;
+          drawMap();
+          updateTurnInfo();
+          
+          if (currentTurn >= simulationData.simulationTurns.length) {
+            clearInterval(autoPlayInterval);
+            autoPlayInterval = null;
+            autoPlayButton.textContent = 'Автовоспроизведение';
+            autoPlayButton.disabled = true;
+            nextTurnButton.disabled = true;
+          }
+        }
+      }, 1000);
+    });
+
+    resetButton.addEventListener('click', () => {
+      if (autoPlayInterval) {
+        clearInterval(autoPlayInterval);
+        autoPlayInterval = null;
+      }
+      resetSimulation();
+    });
+  </script>
+</body>
+</html>
